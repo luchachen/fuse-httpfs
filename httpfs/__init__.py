@@ -67,9 +67,17 @@ class File(Path):
             self.initialized = True
             self.lastModified = 0
             return
+        elif 'X-Powered-By' in r.headers:
+            self.size = 0x40000000
+            self.mode = 0o444
+            self.initialized = True
+            self.lastModified = 0
+            return
         elif r.status_code != 200:
             error = "Status code != 200 for {}: {}".format(url, r.status_code)
             raise Exception(error)
+
+        logging.info("File initialized headers={}".format(r.headers))
         self.size = int(r.headers['content-length'])
         self.lastModified = time.mktime(parsedate(r.headers['last-modified']))
 
@@ -207,7 +215,7 @@ class RelativeLinkCollector(HTMLParser):
             attrs = dict(attrs)
             if "href" in attrs:
                 href = attrs["href"]
-                if "/" in href[:-1] or href[0] == ".":
+                if "/" in href[:-1] or href[0] == "." or href[0] == "/" or href[0] == "?":
                     return
 
                 if href[-1:] == "/":
