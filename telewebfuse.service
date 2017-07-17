@@ -1,0 +1,14 @@
+[Unit]
+Description=Adb server
+Wants=network.target
+After=local-fs.target network-pre.target apparmor.service systemd-sysctl.service systemd-modules-load.service
+
+[Service]
+User=lucha
+Group=lucha
+ExecStart=/usr/local/bin/fuse-httpfs --ssl  none --max_background 8  /home/lucha/teleweb/
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

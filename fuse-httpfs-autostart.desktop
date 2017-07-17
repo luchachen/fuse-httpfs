@@ -1,0 +1,10 @@
+[Desktop Entry]
+Encoding=UTF-8
+Name=fuse httpfs
+Exec=/usr/local/bin/fuse-httpfs --ssl  none --max_background 8 --no_foreground  /home/lucha/teleweb/
+Terminal=false
+Type=Application
+Categories=
+GenericName=
+X-GNOME-Autostart-Phase=Initialization
+NoDisplay=true
