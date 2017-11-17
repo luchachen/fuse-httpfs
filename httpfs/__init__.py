@@ -3,15 +3,18 @@ import sys
 import time
 import netrc
 import logging
-import logging.config
 from urllib.parse import quote, unquote
 from email.utils import parsedate
 from html.parser import HTMLParser
 from stat import S_IFDIR, S_IFREG
 from errno import EIO, ENOENT, EBADF, EHOSTUNREACH
+from multiprocessing import dummy as mp
 
 import fuse
 import requests
+
+
+logger = logging.getLogger(__name__)
 
 
 class Config:
@@ -19,6 +22,7 @@ class Config:
     timeout = None
     verify = None
     system_ca = None
+    poolsize = 15
 
 
 class Path:
@@ -42,7 +46,7 @@ class Path:
         if type(pathElement) == bytes:
             pathElement = pathElement.decode('utf-8')
         p = clazz(parent, unquote(pathElement))
-        logging.info("created {} '{}' referencing {}".format(
+        logger.info("created {} '{}' referencing {}".format(
             clazz.__name__, p.name, p.buildUrl()))
         return p
 
@@ -57,7 +61,7 @@ class File(Path):
 
     def init(self):
         url = self.buildUrl()
-        logging.info("File url={} name={}".format(url, self.name))
+        logger.info("File url={} name={}".format(url, self.name))
         r = self.getSession().head(url, timeout=Config.timeout,
                                    allow_redirects=True)
         r.close()
@@ -81,7 +85,7 @@ class File(Path):
         self.size = int(r.headers['content-length'])
         self.lastModified = time.mktime(parsedate(r.headers['last-modified']))
 
-        logging.info("File initialized url={} name={}".format(url, self.name))
+        logger.info("File initialized url={} name={}".format(url, self.name))
         self.initialized = True
 
     def get(self, size, offset):
@@ -90,15 +94,15 @@ class File(Path):
         url = self.buildUrl()
         bytesRange = '{}-{}'.format(offset, min(self.size, offset + size - 1))
         headers = {'range': 'bytes=' + bytesRange}
-        logging.info("File.get url={} range={}".format(url, bytesRange))
+        logger.info("File.get url={} range={}".format(url, bytesRange))
         r = self.getSession().get(url, headers=headers, timeout=Config.timeout)
         r.close()
         if r.status_code == 200 or r.status_code == 206:
             d = r.content
-            logging.info("Received {} bytes".format(len(d)))
+            logger.info("Received {} bytes".format(len(d)))
             if len(d) > size:
                 errormsg = "size {} > than expected {}".format(len(d), size)
-                logging.error(errormsg)
+                logger.error(errormsg)
                 raise fuse.FuseOSError(EIO)
             return d
         else:
@@ -123,11 +127,11 @@ class Directory(Path):
 
     def init(self):
         url = self.buildUrl() + "/"
-        logging.info("Directory url={} name={}".format(url, self.name))
+        logger.info("Directory url={} name={}".format(url, self.name))
         r = self.getSession().get(url, stream=True, timeout=Config.timeout)
         if r.status_code >= 400 and r.status_code <= 499:
             self.mode = 0o000
-            logging.info("Directory is 4xx {}".format(url))
+            logger.info("Directory is 4xx {}".format(url))
             r.close()
             self.initialized = True
             return
@@ -147,7 +151,12 @@ class Directory(Path):
         self.entries.update(parser.entries)
         r.close()
 
-        logging.info("Diretory loaded {}".format(url))
+        files = filter(lambda obj: isinstance(obj, File),
+                       self.entries.values())
+        pool = mp.Pool(Config.poolsize)
+        pool.map(lambda it: it.init(), files)
+
+        logger.info("Diretory loaded {}".format(url))
         self.initialized = True
 
     def getAttr(self):
@@ -166,12 +175,14 @@ class Server(Directory):
         super().__init__(parent, name)
         self.session = requests.Session()
         self.session.allow_redirects = True
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=Config.poolsize, pool_maxsize=Config.poolsize)
         if Config.verify == "default":
             pass
         elif Config.verify == "system":
             self.session.verify = Config.system_ca
         elif Config.verify == "none":
-            logging.warning("SSL Verification disabled!")
+            logger.warning("SSL Verification disabled!")
             self.session.verify = False
         else:
             raise SystemExit("Invalid value for ssl verification")
@@ -215,10 +226,12 @@ class RelativeLinkCollector(HTMLParser):
             attrs = dict(attrs)
             if "href" in attrs:
                 href = attrs["href"]
-                if "/" in href[:-1] or href[0] == "." or href[0] == "/" or href[0] == "?":
+                if "/" in href[:-1] or href[0] == "." \
+                        or href[0] == "?" or href == "/":
                     return
 
                 if href[-1:] == "/":
+                    # ends with / => directory
                     d = Directory.fromPath(self.parent, href[:-1])
                     self.entries[unquote(href[:-1])] = d
                 else:
@@ -244,23 +257,23 @@ class Httpfs(fuse.LoggingMixIn, fuse.Operations):
             for machine in netrc.netrc().hosts.keys():
                 yield (machine, Server(parent, machine))
         except IOError as e:
-            logging.warning("No .netrc file found, no default machines")
+            logger.warning("No .netrc file found, no default machines")
 
     def getattr(self, path, fh=None):
-        logging.debug("getattr path={}".format(path))
+        logger.debug("getattr path={}".format(path))
         try:
             entry = self._getPath(path)
             if entry:
                 return entry.getAttr()
         except Exception as e:
-            logging.exception("Error in getattr(%s)", path)
+            logger.exception("Error in getattr(%s)", path)
             raise fuse.FuseOSError(EHOSTUNREACH)
         raise fuse.FuseOSError(ENOENT)
 
     def _getPath(self, path):
         """ map path to self.root tree
         a path is build like /<schema>/<server hostname>/<http-path>"""
-        logging.debug("getPath path={}".format(path))
+        logger.debug("getPath path={}".format(path))
         if path == "/":
             return self.root
 
@@ -269,7 +282,7 @@ class Httpfs(fuse.LoggingMixIn, fuse.Operations):
 
         schema, *p = path[1:].split("/")
         if schema not in self.root.entries:
-            logging.debug("schema %s not in root.entries", schema)
+            logger.debug("schema %s not in root.entries", schema)
             return None
         prevEntry = self.root.entries[schema]
         if p == []:
@@ -301,28 +314,31 @@ class Httpfs(fuse.LoggingMixIn, fuse.Operations):
                 r = d.getSession().head(url, timeout=Config.timeout,
                                         allow_redirects=True)
                 if r.status_code == 200:
-                    logging.info("Create directory for path: {} " +
-                                 "at: {}".format(path, url))
+                    logger.info("Create directory for path: {} "
+                                "at: {}".format(path, url))
                     prevEntry.entries[lastElement] = d
                 else:
-                    logging.info("Path not found ({}): {} for {}".format(
+                    logger.info("Path not found ({}): {} for {}".format(
                         r.status_code, path, url))
                     return None
         return prevEntry.entries[lastElement]
 
     def readdir(self, path, fh):
         try:
-            logging.debug("readdir path=%s", path)
+            logger.debug("readdir path=%s", path)
             entry = self._getPath(path)
             if not entry:
                 raise fuse.FuseOSError(EBADF)
             if not entry.initialized:
                 entry.init()
-            return [(".", entry.getAttr(), 0),
-                    ("..", (entry.parent and entry.parent.getAttr() or None), 0)] \
-                + [(it.name, it.getAttr(), 0) for it in entry.entries.values()]
+            return [
+                (".", entry.getAttr(), 0),
+                ("..", (entry.parent and entry.parent.getAttr() or None), 0)
+                ] + [
+                (it.name, it.getAttr(), 0) for it in entry.entries.values()
+                ]
         except Exception as e:
-            logging.exception("Error in readdir(%s)", path)
+            logger.exception("Error in readdir(%s)", path)
             raise fuse.FuseOSError(EIO)
 
     def read(self, path, size, offset, fh):
