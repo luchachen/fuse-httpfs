@@ -68,7 +68,7 @@ class File(Path):
             self.lastModified = 0
             return
         elif 'X-Powered-By' in r.headers:
-            self.size = 0x40000000
+            self.size = 0x40
             self.mode = 0o444
             self.initialized = True
             self.lastModified = 0
